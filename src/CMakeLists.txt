@@ -119,10 +119,6 @@ if (NNG_PLATFORM_WINDOWS)
         )
 endif()
 
-install(FILES transport/inproc/inproc.h
-    DESTINATION include/nng/transport/inproc)
-    
-
 add_subdirectory(protocol/bus0)
 add_subdirectory(protocol/pair0)
 add_subdirectory(protocol/pair1)
@@ -134,6 +130,7 @@ add_subdirectory(protocol/survey0)
 add_subdirectory(transport/inproc)
 add_subdirectory(transport/ipc)
 add_subdirectory(transport/tcp)
+add_subdirectory(transport/tls)
 add_subdirectory(transport/zerotier)
 
 include_directories(AFTER SYSTEM ${PROJECT_SOURCE_DIR}/src
@@ -183,11 +180,6 @@ if (CMAKE_THREAD_LIBS_INIT)
 endif()
 
 # pkg-config file
-if (NNG_REQUIRED_LIBRARIES)
-    foreach (lib ${NNG_REQUIRED_LIBRARIES})
-        set (NNG_REQUIRED_LFLAGS "${NNG_REQUIRED_LFLAGS} -l${lib}")
-    endforeach()
-endif()
 #configure_file (pkgconfig.in ${PROJECT_NAME}.pc @ONLY)
 #install (
 #    FILES ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}.pc
@@ -200,4 +192,3 @@ install (TARGETS ${PROJECT_NAME} ${PROJECT_NAME}_static
 
 # Promote settings to parent
 set(NNG_REQUIRED_LIBRARIES ${NNG_REQUIRED_LIBRARIES} PARENT_SCOPE)
-set(NNG_REQUIRED_LFLAGS ${NNG_REQUIRED_LFLAGS} PARENT_SCOPE)
