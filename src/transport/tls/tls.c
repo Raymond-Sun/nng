@@ -34,6 +34,9 @@ struct nni_tls_pipe {
 	nni_aio *user_rxaio;
 	nni_aio *user_negaio;
 
+	nni_aio *net_send_aio; // TCP bottom send
+	nni_aio *net_recv_aio; // TCP bottom recv
+
 	uint8_t             txlen[sizeof(uint64_t)];
 	uint8_t             rxlen[sizeof(uint64_t)];
 	size_t              gottxhead;
@@ -61,6 +64,115 @@ struct nni_tls_ep {
 	mbedtls_ssl_config cfg;
 };
 
+// A few functions we use to support mbed TLS callbacks.
+
+// We are going to seed data using our random() function, which is already
+// cryptographically strong, in either case.  But the end user may request
+// to use CTR-DRBG, which is NIST approved, to generate output from the
+// first phase pRNG.  We don't do this by default.
+
+static int
+nni_tls_get_entropy(void *arg, unsigned char *buf, size_t len)
+{
+	NNI_ARG_UNUSED(arg);
+	while (len) {
+		uint32_t x = nni_random();
+		size_t   n;
+
+		n = len < sizeof(x) ? len : sizeof(x);
+		memcpy(buf, &x, n);
+		len -= n;
+		buf += n;
+	}
+	return (0);
+}
+
+#ifdef NNG_TRANSPORT_TLS_USE_CTR_DRBG
+
+static nni_mtx                  nni_tls_rng_mx;
+static mbedtls_ctr_drbg_context nni_tls_rng_ctx;
+
+static int
+nni_tls_rng_init(void)
+{
+	int rv;
+	mbedtls_ctr_drbg_init(&nni_tls_rng_ctx);
+	nni_mtx_init(&nni_tls_rng_mx);
+	rv = mbedtls_ctr_drbg_seed(
+	    &nn_tls_rng_ctx, nni_tls_get_entropy, NULL, NULL, 0);
+	// This should never fail, really, because our random never fails.
+	return (rv == 0 ? 0 : NNG_EINTERNAL);
+}
+
+static void
+nni_tls_rng_fini(void)
+{
+	mbedtls_ctr_drbg_free(&nni_tls_rng_ctx);
+	nni_mtx_fini(&nni_tls_rng_mx);
+}
+
+static int
+nni_tls_random(void *arg, unsigned char *buf, size_t sz)
+{
+	int rv;
+	NNI_ARG_UNUSED(arg);
+
+	nni_mtx_lock(&nni_tls_rng_mx);
+	rv = mbedtls_ctr_drbg_random(&nni_tls_rng_ctx, buf, sz);
+	nni_mtx_unlock(&nni_tls_rng_mx);
+	return (rv);
+}
+#else
+
+static int
+nni_tls_rng_init(void)
+{
+	return (0);
+}
+
+static void
+nni_tls_rng_fini(void)
+{
+}
+
+static int
+nni_tls_random(void *arg, unsigned char *buf, size_t len)
+{
+	return (nni_tls_get_entropy(arg, buf, len));
+}
+#endif
+
+static void
+nni_tls_debug(void *ctx, int level, const char *file, int line, const char *s)
+{
+	char buf[128];
+	NNI_ARG_UNUSED(ctx);
+
+	snprintf(buf, sizeof(buf), "%s:%04d: %s", file, line, s);
+	nni_plat_println(buf);
+}
+
+// nni_tls_net_send works like a non-blocking write.  It returns the
+// amount of data written, or if no data can be written then it
+// returns MBEDTLS_ERR_SSL_WANT_WRITE.  Other possible errors are
+// MBEDTLS_ERR_NET_CONN_RESET adn MBEDTLS_ERR_NET_SEND_FAILED.  Both
+// of those are fatal errors.
+static int
+nni_tls_net_send(void *ctx, const unsigned char *buf, size_t len)
+{
+	// Perform non-blocking operation.  We do this using the
+	// pipe's send aio.
+	nni_tls_pipe *p   = ctx;
+	nni_aio *     aio = p->net_send_aio;
+
+	aio->a_niov           = 1;
+	aio->a_iov[0].iov_buf = buf;
+	aio->a_iov[0].iov_len = len;
+	nni_aio_set_timeout(aio, 0); // Polled mode!
+	nni_plat_tcp_pipe_send(p, aio);
+	nni_aio_wait(&aio);
+}
+
 static void nni_tls_pipe_send_cb(void *);
 static void nni_tls_pipe_recv_cb(void *);
 static void nni_tls_pipe_nego_cb(void *);
@@ -69,12 +181,17 @@ static void nni_tls_ep_cb(void *arg);
 static int
 nni_tls_tran_init(void)
 {
+	int rv;
+	if ((rv = nni_tls_rng_init()) != 0) {
+		return (rv);
+	}
 	return (0);
 }
 
 static void
 nni_tls_tran_fini(void)
 {
+	nni_tls_rng_fini();
 }
 
 static void
@@ -675,6 +792,8 @@ nni_tls_ep_init(void **epp, const char *url, nni_sock *sock, int mode)
 	// XXX: VERY VERY IMPORTANT -- REMOVE THIS CODE BEFORE RELEASE
 	// THIS DISABLES ALL VALIDATION...
 	mbedtls_ssl_conf_authmode(&ep->cfg, MBEDTLS_SSL_VERIFY_NONE);
+	mbedtls_ssl_conf_rng(&ep->cfg, nni_tls_random, NULL);
+	mbedtls_ssl_conf_dbg(&ep->cfg, nni_tls_debug, NULL);
 
 	*epp = ep;
 	return (0);
