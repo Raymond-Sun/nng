@@ -8,10 +8,13 @@
 // found online at https://opensource.org/licenses/MIT.
 //
 
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "mbedtls/error.h"
+#include "mbedtls/net_sockets.h"
 #include "mbedtls/ssl.h"
 
 #include "core/nng_impl.h"
@@ -26,16 +29,25 @@
 #define NNG_TLS_MAX_SEND_SIZE 65536
 #endif
 
+// NNG_TLS_MAX_RECV_SIZE limits the amount of data we will receive in a single
+// operation.  As we have to buffer data, this drives the size of our
+// intermediary buffer.
+#ifndef NNG_TLX_MAX_RECV_SIZE
+#define NNG_TLS_MAX_RECV_SIZE
+#endif
+
 struct nni_tls {
 	nni_plat_tcp_pipe * tcp;
 	mbedtls_ssl_context ctx;
 	nni_mtx             lk;
 	nni_aio *           tcp_send;
 	nni_aio *           tcp_recv;
-	int                 sending;
-	int                 closed;
-	int                 hsdone;
-	int                 dbg;
+	bool                sending;
+	bool                recving;
+	bool                closed;
+	bool                hsdone;
+	char *              recvbuf;
+	int                 recvidx;
 	nni_list            sends;     // upper side sends
 	nni_list            recvs;     // upper recv aios
 	nni_aio *           handshake; // handshake aio (upper)
@@ -43,14 +55,12 @@ struct nni_tls {
 
 struct nni_tls_config {
 	mbedtls_ssl_config cfg_ctx;
+	bool               dbg;
 #ifdef NNG_TLS_USE_CTR_DRBG
 	mbedtls_ctr_drbg_context rng_ctx;
 	nni_mtx                  rng_lk;
 #endif
 };
-
-extern int  nni_tls_config_init(nni_tls_config **);
-extern void nni_tls_config_fini(nni_tls_config *);
 
 extern int nni_tls_init(nni_tls **, nni_tls_config *, nni_plat_tcp_pipe *);
 
@@ -71,7 +81,7 @@ nni_tls_dbg(void *ctx, int level, const char *file, int line, const char *s)
 	char            buf[128];
 	nni_tls_config *cfg = ctx;
 
-	if (ctx->dbg) {
+	if (cfg->dbg) {
 		snprintf(buf, sizeof(buf), "%s:%04d: %s", file, line, s);
 		nni_plat_println(buf);
 	}
@@ -184,7 +194,7 @@ nni_tls_strerror(int errnum, char *buf, size_t sz)
 		errnum &= ~NNG_ETRANERR;
 		errnum = -errnum;
 
-		mbedtls_sterror(errnum, buf, sz);
+		mbedtls_strerror(errnum, buf, sz);
 	} else {
 		(void) snprintf(buf, sz, "%s", nng_strerror(errnum));
 	}
@@ -212,12 +222,13 @@ nni_tls_init(nni_tls **tpp, nni_tls_config *cfg, nni_plat_tcp_pipe *tcp)
 
 	nni_aio_list_init(&tp->sends);
 	nni_aio_list_init(&tp->recvs);
-	nni_mtx_int(&tp->lk);
+	nni_mtx_init(&tp->lk);
 	mbedtls_ssl_init(&tp->ctx);
 
 	tp->tcp = tcp;
 
-	if ((rv = nni_aio_init(&tp->tcp_send, nni_tls_send_cb, tp)) != 0) {
+	if (((rv = nni_aio_init(&tp->tcp_send, nni_tls_send_cb, tp)) != 0) ||
+	    ((rv = nni_aio_init(&tp->tcp_recv, nni_tls_recv_cb, tp)) != 0)) {
 		nni_tls_fini(tp);
 		return (rv);
 	}
@@ -248,9 +259,24 @@ nni_tls_send_cb(void *ctx)
 	nni_mtx_lock(&tp->lk);
 	tp->sending = 0;
 	if (tp->handshake != NULL) {
-		nni_tls_handshake(tp);
-	} else if (tp->send != NULL) {
+		nni_tls_do_handshake(tp);
+	} else if (!nni_list_empty(&tp->sends)) {
 		nni_tls_do_send(tp);
+	}
+	nni_mtx_unlock(&tp->lk);
+}
+
+static void
+nni_tls_recv_cb(void *ctx)
+{
+	nni_tls *tp = ctx;
+
+	nni_mtx_lock(&tp->lk);
+	tp->recving = 0;
+	if (tp->handshake != NULL) {
+		nni_tls_do_handshake(tp);
+	} else if (!nni_list_empty(&tp->recvs)) {
+		nni_tls_do_recv(tp);
 	}
 	nni_mtx_unlock(&tp->lk);
 }
@@ -281,10 +307,33 @@ nni_tls_net_send(void *ctx, const unsigned char *buf, size_t len)
 
 	tp->sending                    = 1;
 	tp->tcp_send->a_niov           = 1;
-	tp->tcp_send->a_iov[0].iov_buf = buf;
+	tp->tcp_send->a_iov[0].iov_buf = (char *) buf;
 	tp->tcp_send->a_iov[0].iov_len = len;
 	nni_aio_set_timeout(tp->tcp_send, -1); // No timeout.
 	nni_plat_tcp_pipe_send(tp->tcp, tp->tcp_send);
+	return (len);
+}
+
+static int
+nni_tls_net_recv(void *ctx, const unsigned char *buf, size_t len)
+{
+	nni_tls *tp = ctx;
+
+	// We should already be running with the pipe lock held,
+	// as we are running in that context.
+	if (tp->recving) {
+		return (MBEDTLS_ERR_SSL_WANT_READ);
+	}
+	if (tp->closed) {
+		return (MBEDTLS_ERR_NET_SEND_FAILED);
+	}
+
+	tp->recving                    = 1;
+	tp->tcp_recv->a_niov           = 1;
+	tp->tcp_recv->a_iov[0].iov_buf = (char *) buf;
+	tp->tcp_recv->a_iov[0].iov_len = len;
+	nni_aio_set_timeout(tp->tcp_recv, -1); // No timeout.
+	nni_plat_tcp_pipe_recv(tp->tcp, tp->tcp_recv);
 	return (len);
 }
 
@@ -313,6 +362,29 @@ nni_tls_send(nni_tls *tp, nni_aio *aio)
 	nni_mtx_unlock(&tp->lk);
 }
 
+void
+nni_tls_recv(nni_tls *tp, nni_aio *aio)
+{
+	nni_mtx_lock(&tp->lk);
+	if (nni_aio_start(aio, nni_tls_cancel, tp) != 0) {
+		nni_mtx_unlock(&tp->lk);
+		return;
+	}
+	if (!tp->hsdone) {
+		nni_mtx_unlock(&tp->lk);
+		nni_aio_finish_error(aio, NNG_ESTATE);
+		return;
+	}
+	if (tp->closed) {
+		nni_mtx_unlock(&tp->lk);
+		nni_aio_finish_error(aio, NNG_ECLOSED);
+		return;
+	}
+	nni_list_append(&tp->recvs, aio);
+	nni_tls_do_recv(tp);
+	nni_mtx_unlock(&tp->lk);
+}
+
 // nni_tls_handshake makes a non-blocking attempt to complete the handshake.
 void
 nni_tls_do_handshake(nni_tls *tp)
@@ -325,12 +397,13 @@ nni_tls_do_handshake(nni_tls *tp)
 	}
 	if (tp->closed) {
 		tp->handshake = NULL;
-		nni_aio_finish_error(aio, NNG_ECLOSED)
+		nni_aio_finish_error(aio, NNG_ECLOSED);
+		return;
 	}
 	rv = mbedtls_ssl_handshake(&tp->ctx);
 	switch (rv) {
-	case MBEDTLS_ERR_WANT_WRITE:
-	case MBEDTLS_ERR_WANT_READ:
+	case MBEDTLS_ERR_SSL_WANT_WRITE:
+	case MBEDTLS_ERR_SSL_WANT_READ:
 		// We have underlying I/O to complete first.  We will
 		// be called again by a callback later.
 		return;
@@ -367,7 +440,7 @@ nni_tls_do_send(nni_tls *tp)
 			nni_aio_finish(aio, 0, aio->a_count);
 			return;
 		}
-		if (aio->a_iov[0].iov_cnt == 0) {
+		if (aio->a_iov[0].iov_len == 0) {
 			for (int i = 0; i < aio->a_niov; i++) {
 				aio->a_iov[i] = aio->a_iov[i + 1];
 			}
@@ -375,7 +448,7 @@ nni_tls_do_send(nni_tls *tp)
 			continue;
 		}
 		n = mbedtls_ssl_write(
-		    tp, aio->a_iov[0].iov_buf, aio->a_iov[0].iov_len);
+		    &tp->ctx, aio->a_iov[0].iov_buf, aio->a_iov[0].iov_len);
 		if (n >= 0) {
 			aio->a_iov[0].iov_buf += n;
 			aio->a_iov[0].iov_len -= n;
@@ -396,30 +469,48 @@ nni_tls_do_send(nni_tls *tp)
 	}
 }
 
-// A few functions we use to support mbed TLS callbacks.
-
-// We are going to seed data using our random() function, which is
-// already cryptographically strong, in either case.  But the end user
-// may request to use CTR-DRBG, which is NIST approved, to generate
-// output from the first phase pRNG.  We don't do this by default.
-
-// nni_tls_net_send works like a non-blocking write.  It returns the
-// amount of data written, or if no data can be written then it
-// returns MBEDTLS_ERR_SSL_WANT_WRITE.  Other possible errors are
-// MBEDTLS_ERR_NET_CONN_RESET adn MBEDTLS_ERR_NET_SEND_FAILED.  Both
-// of those are fatal errors.
-static int
-nni_tls_net_send(void *ctx, const unsigned char *buf, size_t len)
+// nni_tls_do_recv is called to try to receive more data if we have not
+// yet completed the I/O.  It also completes any transactions that *have*
+// completed.  It must be called with the lock held.
+static void
+nni_tls_do_recv(nni_tls *tp)
 {
-	// Perform non-blocking operation.  We do this using the
-	// pipe's send aio.
-	nni_tls_pipe *p   = ctx;
-	nni_aio *     aio = p->net_send_aio;
+	nni_aio *aio;
 
-	aio->a_niov           = 1;
-	aio->a_iov[0].iov_buf = buf;
-	aio->a_iov[0].iov_len = len;
-	nni_aio_set_timeout(aio, 0); // Polled mode!
-	nni_plat_tcp_pipe_send(p, aio);
-	nni_aio_wait(&aio);
+	while ((aio = nni_list_first(&tp->recvs)) != NULL) {
+		int n;
+
+		if (aio->a_niov == 0) {
+			// No more I/O to complete.
+			nni_aio_list_remove(aio);
+			nni_aio_finish(aio, 0, aio->a_count);
+			return;
+		}
+		if (aio->a_iov[0].iov_len == 0) {
+			for (int i = 0; i < aio->a_niov; i++) {
+				aio->a_iov[i] = aio->a_iov[i + 1];
+			}
+			aio->a_niov--;
+			continue;
+		}
+		n = mbedtls_ssl_read(
+		    &tp->ctx, aio->a_iov[0].iov_buf, aio->a_iov[0].iov_len);
+		if (n >= 0) {
+			aio->a_iov[0].iov_buf += n;
+			aio->a_iov[0].iov_len -= n;
+			aio->a_count += n;
+			continue;
+		}
+
+		if (n == MBEDTLS_ERR_SSL_WANT_READ) {
+			// Cannot receive any more data right now, wait for
+			// callback.
+			return;
+		}
+
+		// Some other error occurred... this is not good.
+		// Want better diagnostics.
+		nni_aio_list_remove(aio);
+		nni_aio_finish_error(aio, nni_tls_mkerr(n));
+	}
 }
