@@ -266,6 +266,11 @@ nni_tls_init(nni_tls **tpp, nni_tls_config *cfg, nni_plat_tcp_pipe *tcp)
 		return (rv);
 	}
 
+	nni_mtx_lock(&tp->lk);
+	// Kick off a handshake operation.
+	nni_tls_do_handshake(tp);
+	nni_mtx_unlock(&tp->lk);
+
 	*tpp = tp;
 	return (0);
 }
